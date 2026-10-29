@@ -1,17 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-eval_langid.py —— 语种识别模型评测
+eval_langid_12cls.py —— 12 类语种识别模型评测
 
-直接复用 train_langid_cls.py 里的模型定义和字符表构建方法，所以
+直接复用 train_langid_12cls.py 里的模型定义和文本编码方法，所以
 **学生改了训练脚本里的模型结构，评测会自动跟着变**（作业打分的统一口径）。
 
-    python eval_langid.py --model langid_rnn_v8.pt                  # 常规测试集
-    python eval_langid.py --model langid_rnn_v8.pt --split test_hard # 难度切片
-    python eval_langid.py --model langid_rnn_v8.pt --openset        # 开放集拒识
+    python eval_langid_12cls.py                         # 常规测试集
+    python eval_langid_12cls.py --split test_hard       # 难度切片
+    python eval_langid_12cls.py --openset               # 开放集拒识
 
 会打印：accuracy / macro-F1 / 逐类 P-R-F1 / 最常混淆的组合 / 按长度分档的准确率
 
-想看"中英混排这类句子模型认不认得出"，跑隔壁的 demo_mixed_text.py ——
+想看"中英混排这类句子模型认不认得出"，跑隔壁的 demo_mixed_text_12cls.py ——
 那里还有一栏"纯规则"的对照，用来说明为什么不能写 if-else 解决。
 """
 
@@ -21,11 +21,18 @@ import argparse
 from collections import Counter
 
 import torch
-from torch.utils.data import DataLoader
 
-from train_langid_cls import (LangIDClassifier, build_char_vocab, encode,
-                              normalize, macro_f1, confusion, print_confusion,
-                              MAX_LEN, EMBED_DIM, HIDDEN_DIM, DROPOUT)
+from train_langid_12cls import (
+    LangIDClassifier,
+    encode,
+    normalize,
+    macro_f1,
+    confusion,
+    print_confusion,
+    EMBED_DIM,
+    HIDDEN_DIM,
+    DROPOUT,
+)
 
 BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "langid")
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -35,10 +42,13 @@ def load_model(path):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     vocab = ckpt["vocab"]
     labels = ckpt["labels"]
-    model = LangIDClassifier(len(vocab), len(labels),
-                             embed_dim=ckpt.get("embed_dim", EMBED_DIM),
-                             hidden_dim=ckpt.get("hidden_dim", HIDDEN_DIM),
-                             dropout=ckpt.get("dropout", DROPOUT))
+    model = LangIDClassifier(
+        len(vocab),
+        len(labels),
+        embed_dim=ckpt.get("embed_dim", EMBED_DIM),
+        hidden_dim=ckpt.get("hidden_dim", HIDDEN_DIM),
+        dropout=ckpt.get("dropout", DROPOUT),
+    )
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
     return model, vocab, labels
@@ -68,8 +78,10 @@ def accuracy_by_length(texts, preds, golds):
         if not idx:
             continue
         hit = sum(preds[i] == golds[i] for i in idx)
-        print(f"    {lo:>3}~{hi if hi < 999 else '+':>3} 字符："
-              f"{hit:4d}/{len(idx):4d} = {hit/len(idx):.3f}")
+        print(
+            f"    {lo:>3}~{hi if hi < 999 else '+':>3} 字符："
+            f"{hit:4d}/{len(idx):4d} = {hit/len(idx):.3f}"
+        )
 
 
 def per_class_report(preds, golds, labels):
@@ -96,7 +108,7 @@ def run_slices(model, vocab, labels):
 
     for name in ("short", "nodeaccent", "nokana"):
         sub = by_slice.get(name, [])
-        sub = [r for r in sub if r["label"] in label2id]     # 只评测模型认识的标签
+        sub = [r for r in sub if r["label"] in label2id]  # 只评测模型认识的标签
         if not sub:
             print(f"  [{name}] 无可用样本")
             continue
@@ -112,8 +124,9 @@ def run_slices(model, vocab, labels):
         # 每类小计
         per = Counter(g for g in golds)
         hit = Counter(g for p, g in zip(preds, golds) if p == g)
-        print("      " + "  ".join(f"{labels[g]}:{hit[g]}/{per[g]}"
-                                   for g in sorted(per)))
+        print(
+            "      " + "  ".join(f"{labels[g]}:{hit[g]}/{per[g]}" for g in sorted(per))
+        )
 
 
 def run_openset(model, vocab, labels, dev_path):
@@ -140,7 +153,9 @@ def run_openset(model, vocab, labels, dev_path):
     rej = (os_conf < thr).float().mean().item()
     print(f"  阈值（验证集 max-prob 的 5% 分位）= {thr:.3f}")
     print(f"  正常输入保留率 = {keep:.1%}   开放集拒识率 = {rej:.1%}")
-    print(f"  开放集平均置信度 = {os_conf.mean():.3f} （正常输入 = {dev_conf.mean():.3f}）")
+    print(
+        f"  开放集平均置信度 = {os_conf.mean():.3f} （正常输入 = {dev_conf.mean():.3f}）"
+    )
 
     print("\n  没见过的语种被认成了谁（超过阈值的那部分）：")
     preds = os_probs.argmax(dim=1).tolist()
@@ -160,10 +175,12 @@ def run_openset(model, vocab, labels, dev_path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default=os.path.join(HERE, "langid_rnn_v8.pt"))
-    ap.add_argument("--split", default="test", choices=["test", "dev", "test_hard", "none"])
+    ap.add_argument("--model", default=os.path.join(HERE, "langid_rnn_v12.pt"))
+    ap.add_argument(
+        "--split", default="test", choices=["test", "dev", "test_hard", "none"]
+    )
     ap.add_argument("--openset", action="store_true")
-    ap.add_argument("--data-dir", default=os.path.join(BASE, "v8"))
+    ap.add_argument("--data-dir", default=os.path.join(BASE, "v12"))
     args = ap.parse_args()
 
     torch.set_num_threads(1)
@@ -180,7 +197,9 @@ def main():
         golds = [label2id[r["label"]] for r in rows]
         acc = sum(p == g for p, g in zip(preds, golds)) / len(golds)
         print(f"=== {args.split}：{len(rows)} 条 ===")
-        print(f"  accuracy = {acc:.4f}   macro-F1 = {macro_f1(preds, golds, len(labels)):.4f}")
+        print(
+            f"  accuracy = {acc:.4f}   macro-F1 = {macro_f1(preds, golds, len(labels)):.4f}"
+        )
         per_class_report(preds, golds, labels)
         print_confusion(confusion(preds, golds, labels), labels, top=5)
         accuracy_by_length(texts, preds, golds)

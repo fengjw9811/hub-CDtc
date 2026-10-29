@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-demo_mixed_text.py —— 混排文本试玩：模型 vs 纯规则
+demo_mixed_text_12cls.py —— 12 类混排文本试玩：模型 vs 纯规则
 
 【为什么要有这个脚本】
     语种识别最容易想到的做法是"纯规则"：看这句话里哪个 Unicode 区段的字符最多，
@@ -13,17 +13,11 @@ demo_mixed_text.py —— 混排文本试玩：模型 vs 纯规则
          拉丁字母反而更多，规则会判成英语，可这句话明明是中文
 
     下面第一段用手写的混排句子看模型的判断；第二段直接用整张测试集，
-    给这个"纯规则"打出它的真实准确率，和课堂模型的 95.6% 摆在一起看。
-
-【注意】
-    默认加载的是课堂 8 类模型（ar en es hi ja pt ru zh），
-    所以样例里 ko / vi / tr 那几条会自动跳过（模型里根本没这几个类）。
-    换成学生自己训的 12 类模型再跑，它们就会参与打分：
-        python demo_mixed_text.py --model ../..//课后作业/week3/你的模型.pt
+    给这个"纯规则"打出它的真实准确率，和 12 类模型摆在一起看。
 
 【运行】
-    python demo_mixed_text.py                         # 用 langid_rnn_v8.pt
-    python demo_mixed_text.py --model 别的模型.pt
+    python demo_mixed_text_12cls.py
+    python demo_mixed_text_12cls.py --model 别的模型.pt
 """
 
 import os
@@ -34,12 +28,16 @@ import unicodedata
 
 import torch
 
+# Windows 默认 GBK 控制台无法打印印地语和勾选符号，统一走 UTF-8。
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-from eval_langid import load_model, score_batch          # noqa: E402
-from train_langid_cls import normalize                   # noqa: E402
-
+from eval_langid_12cls import load_model, score_batch  # noqa: E402
+from train_langid_12cls import normalize  # noqa: E402
 
 # ─── 手写的混排样例：主体语言 + 混入的英文/其它语言 ────────────────────
 # (文本, 期望语种, 这条例子的看点)
@@ -73,14 +71,14 @@ MIXED_CASES = [
 
 # ─── 纯规则：按 Unicode 区段数票，拉丁字母一律算英语 ──────────────────
 SCRIPT_RULES = [
-    ("\u4e00-\u9fff", "zh"),                  # 汉字 → 中文
-    ("\u3040-\u30ff", "ja"),                  # 假名 → 日语
-    ("\uac00-\ud7af", "ko"),                  # 韩文音节 → 韩语
-    ("\u0400-\u04ff", "ru"),                  # 西里尔 → 俄语
-    ("\u0600-\u06ff", "ar"),                  # 阿拉伯 → 阿拉伯语
-    ("\u0900-\u097f", "hi"),                  # 天城文 → 印地语
-    ("\u0e00-\u0e7f", "th"),                  # 泰文 → 泰语
-    ("a-z", "en"),                            # 拉丁字母 → 一律猜英语
+    ("\u4e00-\u9fff", "zh"),  # 汉字 → 中文
+    ("\u3040-\u30ff", "ja"),  # 假名 → 日语
+    ("\uac00-\ud7af", "ko"),  # 韩文音节 → 韩语
+    ("\u0400-\u04ff", "ru"),  # 西里尔 → 俄语
+    ("\u0600-\u06ff", "ar"),  # 阿拉伯 → 阿拉伯语
+    ("\u0900-\u097f", "hi"),  # 天城文 → 印地语
+    ("\u0e00-\u0e7f", "th"),  # 泰文 → 泰语
+    ("a-z", "en"),  # 拉丁字母 → 一律猜英语
 ]
 
 
@@ -130,10 +128,23 @@ def rule_on_testset(data_dir, labels):
     return right / len(rows), per, len(rows)
 
 
+def model_on_testset(model, vocab, labels, data_dir):
+    """当前模型在同一张测试集上的准确率，避免把对比数字写死。"""
+    rows = []
+    with open(os.path.join(data_dir, "test.csv"), encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            rows.append((r["text"], r["label"]))
+    probs = score_batch(model, [t for t, _ in rows], vocab)
+    preds = probs.argmax(dim=1).tolist()
+    label2id = {lab: i for i, lab in enumerate(labels)}
+    golds = [label2id[g] for _, g in rows]
+    return sum(p == g for p, g in zip(preds, golds)) / len(golds)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default=os.path.join(HERE, "langid_rnn_v8.pt"))
-    ap.add_argument("--data-dir", default=os.path.join(HERE, "data", "langid", "v8"))
+    ap.add_argument("--model", default=os.path.join(HERE, "langid_rnn_v12.pt"))
+    ap.add_argument("--data-dir", default=os.path.join(HERE, "data", "langid", "v12"))
     args = ap.parse_args()
 
     torch.set_num_threads(1)
@@ -163,11 +174,15 @@ def main():
             lose_both.append((text, expect, mp, rp, conf))
 
     total = len(MIXED_CASES) - len(skipped)
-    print(f"\n  结果：模型 {len(win_model) + len(win_both)}/{total}，"
-          f"纯规则 {len(win_both)}/{total}")
+    print(
+        f"\n  结果：模型 {len(win_model) + len(win_both)}/{total}，"
+        f"纯规则 {len(win_both)}/{total}"
+    )
     if skipped:
-        print(f"  跳过 {len(skipped)} 条（当前模型不认识 "
-              f"{'/'.join(sorted({e for _, e in skipped}))}，属于 12 类作业的范围）")
+        print(
+            f"  跳过 {len(skipped)} 条（当前模型不认识 "
+            f"{'/'.join(sorted({e for _, e in skipped}))}，属于 12 类作业的范围）"
+        )
 
     print("\n  ── 规则判错、模型判对的（规则的死穴）──")
     for text, expect, note in win_model:
@@ -182,6 +197,7 @@ def main():
     print("二、把纯规则直接拿去跑整张测试集")
     print("=" * 96)
     rule_acc, per, n = rule_on_testset(args.data_dir, labels)
+    model_acc = model_on_testset(model, vocab, labels, args.data_dir)
     print(f"{'语种':<8}{'规则准确率':>12}   说明")
     for lab in sorted(per):
         hit, tot = per[lab]
@@ -194,10 +210,14 @@ def main():
         else:
             note = ""
         print(f"{lab:<8}{hit/tot:>12.3f}   {note}")
-    print(f"\n  纯规则在 {n} 条测试集上的准确率：{rule_acc:.4f}"
-          f"（课堂模型同一份测试集：0.9558）")
-    print("  → 规则只认得\"字符属于哪个书写系统\"，同系统内的语言它无从下手；")
-    print("    模型学的是字符组合的统计规律，所以 es / pt 也能分开，混排时还能抓住主体语言。")
+    print(
+        f"\n  纯规则在 {n} 条测试集上的准确率：{rule_acc:.4f}"
+        f"（12 类模型同一份测试集：{model_acc:.4f}）"
+    )
+    print('  → 规则只认得"字符属于哪个书写系统"，同系统内的语言它无从下手；')
+    print(
+        "    模型学的是字符组合的统计规律，所以 es / pt 也能分开，混排时还能抓住主体语言。"
+    )
 
 
 if __name__ == "__main__":

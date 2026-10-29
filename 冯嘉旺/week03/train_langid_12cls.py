@@ -2,7 +2,7 @@
 """
 train_langid_12cls.py —— 12 类语种识别作业脚本
 
-在原课堂 8 类代码的基础上独立实现，不修改 train_langid_cls.py。
+在原课堂 8 类代码的基础上独立实现，不依赖 train_langid_cls.py。
 
 任务：一句话 -> 它是哪种语言？
 类别：ar en es hi ja ko pt ru th tr vi zh
@@ -13,32 +13,40 @@ train_langid_12cls.py —— 12 类语种识别作业脚本
     python train_langid_12cls.py --epochs 10 --save langid_rnn_v12.pt
 
 首次运行会根据 data/langid/v12/train.csv 生成
-data/langid/vocab/vocab_v12.txt（格式与 vocab_v8.txt 一致）。
+data/langid/vocab/vocab_v12.txt（字符 \t id \t 出现次数）。
 
-训练完成后可直接用原评估脚本：
-    python eval_langid.py --model langid_rnn_v12.pt --data-dir data/langid/v12 --split test
-    python eval_langid.py --model langid_rnn_v12.pt --data-dir data/langid/v12 --split test_hard
-    python eval_langid.py --model langid_rnn_v12.pt --data-dir data/langid/v12 --openset
+训练完成后可直接用配套评估脚本：
+    python eval_langid_12cls.py --model langid_rnn_v12.pt --data-dir data/langid/v12 --split test
+    python eval_langid_12cls.py --model langid_rnn_v12.pt --data-dir data/langid/v12 --split test_hard
+    python eval_langid_12cls.py --model langid_rnn_v12.pt --data-dir data/langid/v12 --openset
 """
 
 import os
+import sys
+import csv
 import time
 import random
 import argparse
+import unicodedata
 from collections import Counter, OrderedDict
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, DataLoader
 
-from train_langid_cls import (
-    BATCH_SIZE, DROPOUT, EMBED_DIM, HIDDEN_DIM, LR, MAX_LEN,
-    LangIDClassifier, TextDataset, confusion, encode, load_split,
-    load_vocab_file, macro_f1, normalize, predict, print_confusion,
-)
+# Windows 默认 GBK 控制台无法打印印地语等字符，统一走 UTF-8。
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 
 SEED = 42
+MAX_LEN = 40  # 中文中位长度约 10 字符，统一截到 40
+EMBED_DIM = 64
+HIDDEN_DIM = 64
+DROPOUT = 0.3
+BATCH_SIZE = 64
+LR = 1e-3
 EPOCHS = 8
 NUM_THREADS = 1
 
@@ -47,8 +55,13 @@ DATA_DIR = os.path.join(HERE, "data", "langid", "v12")
 VOCAB_PATH = os.path.join(HERE, "data", "langid", "vocab", "vocab_v12.txt")
 
 # 12 类按字母序排列。模型输出维度 = len(LABELS)。
-LABELS = ["ar", "en", "es", "hi", "ja", "ko",
-          "pt", "ru", "th", "tr", "vi", "zh"]
+LABELS = ["ar", "en", "es", "hi", "ja", "ko", "pt", "ru", "th", "tr", "vi", "zh"]
+
+
+def normalize(text):
+    # NFKC 归一化 + 转小写 + 只保留字母(L)与组合符号(M)。
+    t = unicodedata.normalize("NFKC", text).lower()
+    return "".join(c for c in t if unicodedata.category(c)[0] in ("L", "M"))
 
 
 def build_char_vocab(sentences, min_freq=1):
@@ -56,17 +69,132 @@ def build_char_vocab(sentences, min_freq=1):
     freq = Counter()
     for s in sentences:
         freq.update(normalize(s))
-    chars = sorted(((c, n) for c, n in freq.items() if n >= min_freq),
-                   key=lambda kv: (-kv[1], kv[0]))
+    chars = sorted(
+        ((c, n) for c, n in freq.items() if n >= min_freq),
+        key=lambda kv: (-kv[1], kv[0]),
+    )
     vocab = OrderedDict([("<PAD>", 0), ("<UNK>", 1)])
     for ch, _ in chars:
         vocab[ch] = len(vocab)
     return vocab, freq
 
 
+def load_vocab_file(path):
+    # 读取「字符 \t id \t 出现次数」格式的字符表。
+    vocab = OrderedDict()
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("#") or not line.strip():
+                continue
+            ch, idx, _freq = line.rstrip("\n").split("\t")
+            vocab[ch] = int(idx)
+    return vocab
+
+
+def encode(text, vocab, maxlen=MAX_LEN):
+    ids = [vocab.get(ch, 1) for ch in normalize(text)][:maxlen]
+    ids += [0] * (maxlen - len(ids))
+    return ids
+
+
+def load_split(data_dir, name):
+    path = os.path.join(data_dir, f"{name}.csv")
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            rows.append((r["text"], r["label"]))
+    return rows
+
+
+class TextDataset(Dataset):
+    def __init__(self, rows, vocab, label2id):
+        self.X = [encode(t, vocab) for t, _ in rows]
+        self.y = [label2id[l] for _, l in rows]
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, i):
+        return torch.tensor(self.X[i], dtype=torch.long), self.y[i]
+
+
+class LangIDClassifier(nn.Module):
+    # Embedding -> RNN -> 掩码 MaxPool -> LayerNorm -> Dropout -> Linear
+
+    def __init__(
+        self,
+        vocab_size,
+        num_classes,
+        embed_dim=EMBED_DIM,
+        hidden_dim=HIDDEN_DIM,
+        dropout=DROPOUT,
+    ):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.rnn = nn.RNN(embed_dim, hidden_dim, batch_first=True)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_dim, num_classes)
+
+    def forward(self, x):
+        mask = (x != 0).unsqueeze(-1)
+        h, _ = self.rnn(self.embedding(x))
+        h = h.masked_fill(~mask, -1e9)
+        pooled = h.max(dim=1)[0]
+        pooled = self.dropout(self.norm(pooled))
+        return self.fc(pooled)
+
+
+def predict(model, loader):
+    model.eval()
+    preds, golds = [], []
+    with torch.no_grad():
+        for X, y in loader:
+            preds += model(X).argmax(dim=1).tolist()
+            golds += y.tolist()
+    return preds, golds
+
+
+def macro_f1(preds, golds, num_classes):
+    f1s = []
+    for c in range(num_classes):
+        tp = sum(p == c and g == c for p, g in zip(preds, golds))
+        fp = sum(p == c and g != c for p, g in zip(preds, golds))
+        fn = sum(p != c and g == c for p, g in zip(preds, golds))
+        if tp + fp + fn == 0:
+            continue
+        prec = tp / (tp + fp) if tp + fp else 0.0
+        rec = tp / (tp + fn) if tp + fn else 0.0
+        f1s.append(2 * prec * rec / (prec + rec) if prec + rec else 0.0)
+    return sum(f1s) / len(f1s)
+
+
+def confusion(preds, golds, labels):
+    n = len(labels)
+    mat = [[0] * n for _ in range(n)]
+    for p, g in zip(preds, golds):
+        mat[g][p] += 1
+    return mat
+
+
+def print_confusion(mat, labels, top=3):
+    pairs = [
+        (mat[g][p], labels[g], labels[p])
+        for g in range(len(labels))
+        for p in range(len(labels))
+        if g != p
+    ]
+    pairs.sort(reverse=True)
+    print("  最常混淆的组合（真实 → 预测）：")
+    for cnt, g, p in pairs[:top]:
+        if cnt == 0:
+            break
+        print(f"    {g} → {p}: {cnt} 条")
+
+
 def save_vocab(vocab, freq, path):
-    """按 vocab_v8.txt 的格式写出：字符 \\t id \\t 出现次数。"""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    """按字符表格式写出：字符 \\t id \\t 出现次数。"""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write("# 字符\tid\t出现次数\n")
         for ch, idx in vocab.items():
@@ -92,8 +220,11 @@ def sample_per_class(rows, per_class, seed=SEED):
     for text, label in rows:
         by_label.setdefault(label, []).append(text)
     rng = random.Random(seed)
-    sampled = [(t, l) for l, texts in by_label.items()
-               for t in rng.sample(texts, min(per_class, len(texts)))]
+    sampled = [
+        (t, l)
+        for l, texts in by_label.items()
+        for t in rng.sample(texts, min(per_class, len(texts)))
+    ]
     rng.shuffle(sampled)
     return sampled
 
@@ -105,8 +236,9 @@ def main():
     ap.add_argument("--epochs", type=int, default=EPOCHS)
     ap.add_argument("--per-class", type=int, default=0)
     ap.add_argument("--threads", type=int, default=NUM_THREADS)
-    ap.add_argument("--rebuild-vocab", action="store_true",
-                    help="强制从训练集重新生成字符表")
+    ap.add_argument(
+        "--rebuild-vocab", action="store_true", help="强制从训练集重新生成字符表"
+    )
     ap.add_argument("--save", default=os.path.join(HERE, "langid_rnn_v12.pt"))
     args = ap.parse_args()
 
@@ -140,13 +272,16 @@ def main():
         train_rows = sample_per_class(train_rows, args.per_class)
 
     print(f"数据目录：{args.data_dir}")
-    print(f"  训练 {len(train_rows)} 条 / 验证 {len(dev_rows)} 条 / 测试 {len(test_rows)} 条")
+    print(
+        f"  训练 {len(train_rows)} 条 / 验证 {len(dev_rows)} 条 / 测试 {len(test_rows)} 条"
+    )
     print(f"  类别 {num_classes} 个：{' '.join(LABELS)}")
     print(f"  字符表 {len(vocab)} 个字符（{os.path.basename(args.vocab)}）")
     print(f"  随机猜的准确率基准：{1 / num_classes:.1%}")
 
-    train_loader = DataLoader(TextDataset(train_rows, vocab, label2id),
-                              batch_size=BATCH_SIZE, shuffle=True)
+    train_loader = DataLoader(
+        TextDataset(train_rows, vocab, label2id), batch_size=BATCH_SIZE, shuffle=True
+    )
     dev_loader = DataLoader(TextDataset(dev_rows, vocab, label2id), batch_size=128)
     test_loader = DataLoader(TextDataset(test_rows, vocab, label2id), batch_size=128)
 
@@ -169,10 +304,14 @@ def main():
             total += loss.item()
         preds, golds = predict(model, dev_loader)
         acc = sum(p == g for p, g in zip(preds, golds)) / len(golds)
-        print(f"Epoch {epoch:2d}/{args.epochs}  loss={total/len(train_loader):.4f}  "
-              f"dev_acc={acc:.4f}")
+        print(
+            f"Epoch {epoch:2d}/{args.epochs}  loss={total/len(train_loader):.4f}  "
+            f"dev_acc={acc:.4f}"
+        )
     elapsed = time.time() - t0
-    print(f"\n训练耗时：{elapsed:.0f} 秒（{args.epochs} 个 epoch，{args.threads} 线程）")
+    print(
+        f"\n训练耗时：{elapsed:.0f} 秒（{args.epochs} 个 epoch，{args.threads} 线程）"
+    )
 
     preds, golds = predict(model, test_loader)
     acc = sum(p == g for p, g in zip(preds, golds)) / len(golds)
@@ -196,11 +335,19 @@ def main():
             print(f"  [{LABELS[pid]} {prob[pid]:.2f}]  {text[:50]}")
 
     if args.save:
-        torch.save({"state_dict": model.state_dict(), "vocab": dict(vocab),
-                    "labels": LABELS, "maxlen": MAX_LEN,
-                    "embed_dim": EMBED_DIM, "hidden_dim": HIDDEN_DIM,
-                    "dropout": DROPOUT, "data_dir": args.data_dir},
-                   args.save)
+        torch.save(
+            {
+                "state_dict": model.state_dict(),
+                "vocab": dict(vocab),
+                "labels": LABELS,
+                "maxlen": MAX_LEN,
+                "embed_dim": EMBED_DIM,
+                "hidden_dim": HIDDEN_DIM,
+                "dropout": DROPOUT,
+                "data_dir": args.data_dir,
+            },
+            args.save,
+        )
         print(f"\n模型已保存：{args.save}")
 
 
